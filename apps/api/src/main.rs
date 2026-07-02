@@ -357,6 +357,50 @@ async fn update_robot_status(
     Ok(Json(row_to_robot(row)?))
 }
 
+async fn renew_certificate(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<RenewCertificateRequest>,
+) -> Result<Json<RobotDto>, ApiError> {
+    let days = payload.days.unwrap_or(365);
+
+    if days < 1 || days > 1095 {
+        return Err(ApiError::Validation(
+            "days must be between 1 and 1095".to_string(),
+        ));
+    }
+
+    let row = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"
+            UPDATE robots
+            SET
+              certificate_expires_at = now() + ($1::int * interval '1 day'),
+              updated_at = now()
+            WHERE id = $2::uuid
+            RETURNING
+              id::text,
+              serial_number,
+              name,
+              model,
+              firmware_version,
+              ip_address::text AS ip_address,
+              connection_status,
+              config,
+              certificate_expires_at::text,
+              created_at::text,
+              updated_at::text
+            "#,
+            vec![days.into(), id.into()],
+        ))
+        .await?
+        .ok_or_else(|| ApiError::NotFound("robot not found".to_string()))?;
+
+    Ok(Json(row_to_robot(row)?))
+}
+
 async fn list_robot_api_keys(
     State(state): State<AppState>,
     Path(robot_id): Path<String>,

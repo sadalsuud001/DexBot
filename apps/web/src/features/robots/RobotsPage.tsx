@@ -7,6 +7,7 @@ import {
 } from "./api";
 import type { Robot, RobotStatus } from "./types";
 import { type ReactNode } from "react";
+import { RobotApiKeysPanel } from "./RobotApiKeysPanel";
 
 export function RobotsPage() {
   const { data: robots, isLoading, isError, error } = useRobots();
@@ -156,6 +157,8 @@ function RobotCard({
 
       <div className="mt-5 flex flex-wrap gap-2">
 
+      
+
       <ActionButton
         disabled={isMutating}
         onClick={() => onStatusChange("online")}
@@ -184,6 +187,8 @@ function RobotCard({
         Renew Cert
       </ActionButton>
     </div>
+
+    <RobotApiKeysPanel robotId={robot.id} />
 
       <div className="mt-5">
         <div className="mb-2 text-sm font-medium text-slate-300">

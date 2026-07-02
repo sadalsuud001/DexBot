@@ -40,3 +40,43 @@ export type RenewCertificatePayload = {
   id: string;
   days: number;
 };
+
+export type RobotApiKeyStatus = "active" | "revoked" | "expired";
+
+export type RobotApiKey = {
+  id: string;
+  robot_id: string;
+  name: string;
+  key_fingerprint: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
+  status: RobotApiKeyStatus;
+};
+
+export type CreateRobotApiKeyPayload = {
+  robotId: string;
+  name: string;
+  expires_in_days?: number;
+};
+
+export type CreateRobotApiKeyResponse = {
+  api_key: RobotApiKey;
+  plaintext_key: string;
+};
+
+export type RotateRobotApiKeyPayload = {
+  robotId: string;
+  keyId: string;
+};
+
+export type RotateRobotApiKeyResponse = {
+  api_key: RobotApiKey;
+  plaintext_key: string;
+};
+
+export type RevokeRobotApiKeyPayload = {
+  robotId: string;
+  keyId: string;
+};

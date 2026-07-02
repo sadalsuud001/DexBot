@@ -1,9 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiGet, apiPatch, apiPost } from "../../lib/api";
 import type {
+  CreateRobotApiKeyPayload,
+  CreateRobotApiKeyResponse,
   CreateRobotPayload,
   RenewCertificatePayload,
+  RevokeRobotApiKeyPayload,
   Robot,
+  RobotApiKey,
+  RotateRobotApiKeyPayload,
+  RotateRobotApiKeyResponse,
   UpdateRobotStatusPayload,
 } from "./types";
 
@@ -57,6 +63,68 @@ export function useRenewCertificate() {
       ),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["robots"] });
+    },
+  });
+}
+
+export function useRobotApiKeys(robotId: string) {
+  return useQuery({
+    queryKey: ["robots", robotId, "api-keys"],
+    queryFn: () => apiGet<RobotApiKey[]>(`/api/robots/${robotId}/api-keys`),
+    refetchInterval: 5000,
+  });
+}
+
+export function useCreateRobotApiKey() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (payload: CreateRobotApiKeyPayload) =>
+      apiPost<CreateRobotApiKeyResponse, { name: string; expires_in_days?: number }>(
+        `/api/robots/${payload.robotId}/api-keys`,
+        {
+          name: payload.name,
+          expires_in_days: payload.expires_in_days,
+        }
+      ),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["robots", variables.robotId, "api-keys"],
+      });
+    },
+  });
+}
+
+export function useRotateRobotApiKey() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (payload: RotateRobotApiKeyPayload) =>
+      apiPost<RotateRobotApiKeyResponse, Record<string, never>>(
+        `/api/robots/${payload.robotId}/api-keys/${payload.keyId}/rotate`,
+        {}
+      ),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["robots", variables.robotId, "api-keys"],
+      });
+    },
+  });
+}
+
+export function useRevokeRobotApiKey() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (payload: RevokeRobotApiKeyPayload) =>
+      apiPost<RobotApiKey, Record<string, never>>(
+        `/api/robots/${payload.robotId}/api-keys/${payload.keyId}/revoke`,
+        {}
+      ),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["robots", variables.robotId, "api-keys"],
+      });
     },
   });
 }
