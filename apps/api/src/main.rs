@@ -1,3 +1,6 @@
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
 use axum::{
     extract::{Path, State},
     http::{Method, StatusCode},
@@ -62,6 +65,41 @@ struct UpdateRobotStatusRequest {
 #[derive(Deserialize)]
 struct RenewCertificateRequest {
     days: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RobotApiKeyDto {
+    id: String,
+    robot_id: String,
+    name: String,
+    key_fingerprint: String,
+    expires_at: Option<String>,
+    revoked_at: Option<String>,
+    last_used_at: Option<String>,
+    created_at: String,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct CreateRobotApiKeyRequest {
+    name: String,
+    expires_in_days: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct CreateRobotApiKeyResponse {
+    api_key: RobotApiKeyDto,
+
+    // Only returned once during create or rotate.
+    plaintext_key: String,
+}
+
+#[derive(Serialize)]
+struct RotateRobotApiKeyResponse {
+    api_key: RobotApiKeyDto,
+
+    // Only returned once during rotation.
+    plaintext_key: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,6 +176,18 @@ async fn main() {
         .route(
             "/api/robots/{id}/renew-certificate",
             axum::routing::post(renew_certificate),
+        )
+        .route(
+            "/api/robots/{id}/api-keys",
+            get(list_robot_api_keys).post(create_robot_api_key),
+        )
+        .route(
+            "/api/robots/{id}/api-keys/{key_id}/rotate",
+            axum::routing::post(rotate_robot_api_key),
+        )
+        .route(
+            "/api/robots/{id}/api-keys/{key_id}/revoke",
+            axum::routing::post(revoke_robot_api_key),
         )
         .with_state(state)
         .layer(cors)
@@ -307,48 +357,179 @@ async fn update_robot_status(
     Ok(Json(row_to_robot(row)?))
 }
 
-async fn renew_certificate(
+async fn list_robot_api_keys(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(payload): Json<RenewCertificateRequest>,
-) -> Result<Json<RobotDto>, ApiError> {
-    let days = payload.days.unwrap_or(365);
+    Path(robot_id): Path<String>,
+) -> Result<Json<Vec<RobotApiKeyDto>>, ApiError> {
+    let rows = state
+        .db
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"
+            SELECT
+              id::text,
+              robot_id::text,
+              name,
+              key_hash,
+              expires_at::text,
+              revoked_at::text,
+              last_used_at::text,
+              created_at::text
+            FROM robot_api_keys
+            WHERE robot_id = $1::uuid
+            ORDER BY created_at DESC
+            "#,
+            vec![robot_id.into()],
+        ))
+        .await?;
 
-    if days < 1 || days > 1095 {
+    let keys = rows
+        .into_iter()
+        .map(row_to_api_key)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(keys))
+}
+
+async fn create_robot_api_key(
+    State(state): State<AppState>,
+    Path(robot_id): Path<String>,
+    Json(payload): Json<CreateRobotApiKeyRequest>,
+) -> Result<(StatusCode, Json<CreateRobotApiKeyResponse>), ApiError> {
+    validate_required("name", &payload.name)?;
+
+    let expires_in_days = payload.expires_in_days.unwrap_or(365);
+
+    if expires_in_days < 1 || expires_in_days > 1095 {
         return Err(ApiError::Validation(
-            "days must be between 1 and 1095".to_string(),
+            "expires_in_days must be between 1 and 1095".to_string(),
         ));
     }
+
+    let plaintext_key = generate_api_key();
+    let key_hash = hash_api_key(&plaintext_key);
 
     let row = state
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
             r#"
-            UPDATE robots
-            SET
-              certificate_expires_at = now() + ($1::int * interval '1 day'),
-              updated_at = now()
-            WHERE id = $2::uuid
+            INSERT INTO robot_api_keys (
+              robot_id,
+              name,
+              key_hash,
+              expires_at
+            )
+            VALUES (
+              $1::uuid,
+              $2,
+              $3,
+              now() + ($4::int * interval '1 day')
+            )
             RETURNING
               id::text,
-              serial_number,
+              robot_id::text,
               name,
-              model,
-              firmware_version,
-              ip_address::text AS ip_address,
-              connection_status,
-              config,
-              certificate_expires_at::text,
-              created_at::text,
-              updated_at::text
+              key_hash,
+              expires_at::text,
+              revoked_at::text,
+              last_used_at::text,
+              created_at::text
             "#,
-            vec![days.into(), id.into()],
+            vec![
+                robot_id.into(),
+                payload.name.into(),
+                key_hash.into(),
+                expires_in_days.into(),
+            ],
         ))
         .await?
-        .ok_or_else(|| ApiError::NotFound("robot not found".to_string()))?;
+        .ok_or_else(|| ApiError::BadRow("insert returned no API key".to_string()))?;
 
-    Ok(Json(row_to_robot(row)?))
+    let api_key = row_to_api_key(row)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateRobotApiKeyResponse {
+            api_key,
+            plaintext_key,
+        }),
+    ))
+}
+
+async fn rotate_robot_api_key(
+    State(state): State<AppState>,
+    Path((robot_id, key_id)): Path<(String, String)>,
+) -> Result<Json<RotateRobotApiKeyResponse>, ApiError> {
+    let plaintext_key = generate_api_key();
+    let key_hash = hash_api_key(&plaintext_key);
+
+    let row = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"
+            UPDATE robot_api_keys
+            SET
+              key_hash = $1
+            WHERE
+              id = $2::uuid
+              AND robot_id = $3::uuid
+              AND revoked_at IS NULL
+            RETURNING
+              id::text,
+              robot_id::text,
+              name,
+              key_hash,
+              expires_at::text,
+              revoked_at::text,
+              last_used_at::text,
+              created_at::text
+            "#,
+            vec![key_hash.into(), key_id.into(), robot_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| ApiError::NotFound("active API key not found".to_string()))?;
+
+    let api_key = row_to_api_key(row)?;
+
+    Ok(Json(RotateRobotApiKeyResponse {
+        api_key,
+        plaintext_key,
+    }))
+}
+
+async fn revoke_robot_api_key(
+    State(state): State<AppState>,
+    Path((robot_id, key_id)): Path<(String, String)>,
+) -> Result<Json<RobotApiKeyDto>, ApiError> {
+    let row = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"
+            UPDATE robot_api_keys
+            SET revoked_at = now()
+            WHERE
+              id = $1::uuid
+              AND robot_id = $2::uuid
+              AND revoked_at IS NULL
+            RETURNING
+              id::text,
+              robot_id::text,
+              name,
+              key_hash,
+              expires_at::text,
+              revoked_at::text,
+              last_used_at::text,
+              created_at::text
+            "#,
+            vec![key_id.into(), robot_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| ApiError::NotFound("active API key not found".to_string()))?;
+
+    Ok(Json(row_to_api_key(row)?))
 }
 
 fn robot_select_sql() -> &'static str {
@@ -407,5 +588,58 @@ fn validate_robot_status(status: &str) -> Result<(), ApiError> {
         _ => Err(ApiError::Validation(
             "connection_status must be one of: online, offline, error".to_string(),
         )),
+    }
+}
+
+fn row_to_api_key(row: QueryResult) -> Result<RobotApiKeyDto, ApiError> {
+    let key_hash = get_string(&row, "key_hash")?;
+    let revoked_at: Option<String> = row.try_get("", "revoked_at").ok();
+    let expires_at: Option<String> = row.try_get("", "expires_at").ok();
+    let last_used_at: Option<String> = row.try_get("", "last_used_at").ok();
+
+    let status = if revoked_at.is_some() {
+        "revoked".to_string()
+    } else if let Some(expires) = &expires_at {
+        if is_expired_timestamp(expires) {
+            "expired".to_string()
+        } else {
+            "active".to_string()
+        }
+    } else {
+        "active".to_string()
+    };
+
+    Ok(RobotApiKeyDto {
+        id: get_string(&row, "id")?,
+        robot_id: get_string(&row, "robot_id")?,
+        name: get_string(&row, "name")?,
+        key_fingerprint: fingerprint_hash(&key_hash),
+        expires_at,
+        revoked_at,
+        last_used_at,
+        created_at: get_string(&row, "created_at")?,
+        status,
+    })
+}
+
+fn generate_api_key() -> String {
+    format!("dxb_{}", Uuid::new_v4().simple())
+}
+
+fn hash_api_key(plaintext: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(plaintext.as_bytes());
+    let result = hasher.finalize();
+    hex::encode(result)
+}
+
+fn fingerprint_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
+}
+
+fn is_expired_timestamp(timestamp: &str) -> bool {
+    match chrono::DateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S%.f%#z") {
+        Ok(expires_at) => expires_at < chrono::Utc::now(),
+        Err(_) => false,
     }
 }
